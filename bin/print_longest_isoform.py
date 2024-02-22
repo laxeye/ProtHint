@@ -18,8 +18,7 @@ def extractFeature(text, feature):
     result = re.search(regex, text)
     if result:
         return result.groups()[0]
-    else:
-        return None
+    return None
 
 
 def computeLengths(input):
@@ -53,22 +52,23 @@ def getLongestTranscript(transcriptLengths):
     return longestTranscripts
 
 
-def printLongest(input, longestTranscripts):
-    for row in csv.reader(open(input), delimiter='\t'):
-        if len(row) == 0 or row[0].startswith('#'): continue
-        gene = extractFeature(row[8], 'gene_id')
-        transcript = extractFeature(row[8], 'transcript_id')
-        if not gene or not transcript:
-            continue
-        if (longestTranscripts[gene] == transcript):
-            print('\t'.join(row))
+def printLongest(args, longestTranscripts):
+    with open(args.output, 'w') as out_hanlder:
+        for row in csv.reader(open(args.input), delimiter='\t'):
+            if len(row) == 0 or row[0].startswith('#'): continue
+            gene = extractFeature(row[8], 'gene_id')
+            transcript = extractFeature(row[8], 'transcript_id')
+            if not gene or not transcript:
+                continue
+            if (longestTranscripts[gene] == transcript):
+                print('\t'.join(row), file=out_hanlder)
 
 
 def main():
     args = parseCmd()
     transcriptLengths = computeLengths(args.input)
     longestTranscripts = getLongestTranscript(transcriptLengths)
-    printLongest(sys.argv[1], longestTranscripts)
+    printLongest(args, longestTranscripts)
 
 
 def parseCmd():
@@ -76,13 +76,23 @@ def parseCmd():
     parser = argparse.ArgumentParser(description='Print longest isoforms in a \
                                      gtf file')
 
-    parser.add_argument('input', type=str,
+    parser.add_argument('-i', '--input', type=str,
                         help='Input gtf file')
+    parser.add_argument('-o', '--output', type=str, default='longest_seed_isoforms.gtf',
+                        help='Output gtf file')
 
-    args = parser.parse_args()
-
-    return args
+    return parser.parse_args()
 
 
 if __name__ == '__main__':
     main()
+
+
+try:
+    pass
+except Exception as e:
+    raise
+else:
+    pass
+finally:
+    pass

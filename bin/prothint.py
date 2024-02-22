@@ -17,23 +17,19 @@ import tempfile
 
 
 VERSION = '2.6.0'
-workDir = ''
-binDir = ''
-genome = ''
-proteins = ''
-threads = ''
 
-ProtHintRef = 'https://doi.org/10.1093/nargab/lqaa026'
-DIAMONDRef = 'https://doi.org/10.1038/nmeth.3176'
-SpalnRef = 'https://doi.org/10.1093/bioinformatics/btn460'
+
+def stderr_message(msg):
+    sys.stderr.write(f"[{time.ctime()}] {msg}\n")
 
 
 def main():
     args = parseCmd()
 
-    setEnvironment(args)
+    args = setEnvironment(args)
 
-    processInputProteins(args)
+    if not args.diamond_db:
+        args = processInputProteins(args)
 
     if args.geneSeeds and args.prevGeneSeeds:
         nextIteration(args)
@@ -47,36 +43,34 @@ def standardRun(args):
     Args:
         args: Command line arguments
     """
-    seedGenes = args.geneSeeds
-    if not seedGenes:
-        seedGenes = runGeneMarkES(args.pbs, args.fungus)
+    if not args.geneSeeds:
+        args.geneSeeds = runGeneMarkES(args)
     else:
-        sys.stderr.write("[" + time.ctime() + "] Skipping GeneMark-ES, using "
-                         "the supplied gene seeds file instead\n")
+        stderr_message('''Skipping GeneMark-ES, using the supplied gene seeds
+            file instead''')
 
-    translateSeeds(seedGenes)
+    translateSeeds(args, args.geneSeeds)
 
-    diamondPairs = args.diamondPairs
-    if not diamondPairs:
-        diamondPairs = runDiamond(args.maxProteinsPerSeed, args.evalue)
+    if not args.diamondPairs:
+        args.diamondPairs = runDiamond(args)
     else:
-        sys.stderr.write("[" + time.ctime() + "] Skipping DIAMOND, using "
-                         "the supplied DIAMOND output file instead\n")
+        stderr_message('''Skipping DIAMOND, using the supplied DIAMOND output
+            file instead''')
 
-    prepareSeedSequences(diamondPairs)
+    prepareSeedSequences(args)
 
-    runSpaln(diamondPairs, args.pbs, args.minExonScore,
+    runSpaln(args, args.diamondPairs, args.pbs, args.minExonScore,
              args.nonCanonicalSpliceSites, args.longGene, args.longProtein)
 
-    checkOutputs(diamondPairs, seedGenes)
-    flagTopProteins(diamondPairs)
-    processSpalnOutput(args.nonCanonicalSpliceSites)
+    checkOutputs(args)
+    flagTopProteins(args)
+    processSpalnOutput(args)
 
     if args.cleanup:
-        cleanup()
-
-    os.remove(proteins)
-    sys.stderr.write("[" + time.ctime() + "] ProtHint finished.\n")
+        cleanup(args)
+    if not args.diamond_db:
+        os.remove(args.proteins)  # Args contains not the original file, but temporary
+    stderr_message('ProtHint finished.')
 
 
 def nextIteration(args):
@@ -89,20 +83,19 @@ def nextIteration(args):
     Args:
         args: Command line arguments
     """
-    sys.stderr.write("ProtHint is running in the iterative mode.\n")
-    prepareDataForNextIteration(args.geneSeeds, args.prevGeneSeeds,
-                                args.prevSpalnGff)
+    stderr_message("ProtHint is running in the iterative mode.")
+    prepareDataForNextIteration(args)
 
     diamondPairs = ""
     if os.path.getsize("uniqueSeeds.gtf") != 0:
-        translateSeeds("uniqueSeeds.gtf")
-        diamondPairs = runDiamond(args.maxProteinsPerSeed, args.evalue)
+        translateSeeds(args, "uniqueSeeds.gtf")
+        diamondPairs = runDiamond(args)
         prepareSeedSequences(diamondPairs)
         runSpaln(diamondPairs, args.pbs, args.minExonScore,
                  args.nonCanonicalSpliceSites, args.longGene, args.longProtein)
         flagTopProteins(diamondPairs)
         # Append subset of hints from the previous iteration to the current result
-        os.chdir(workDir)
+        os.chdir(args.workdir)
         with open("Spaln/spaln.gff", "a") as new:
             with open("prevHints.gff", "r") as prev:
                 for line in prev:
@@ -116,100 +109,107 @@ def nextIteration(args):
             os.mkdir("Spaln")
         shutil.move("prevHints.gff", "Spaln/spaln.gff")
 
-    processSpalnOutput(args.nonCanonicalSpliceSites)
+    processSpalnOutput(args)
 
-    os.remove(proteins)
+    os.remove(args.proteins)  # Args contains not the original file, but temporary
     sys.stderr.write("[" + time.ctime() + "] ProtHint finished.\n")
 
 
-def prepareDataForNextIteration(geneSeeds, prevGeneSeeds, prevSpalnGff):
+def prepareDataForNextIteration(args):
     """Select gene seeds which are unique in this iteration and hints from
     previous iteration of ProtHint which correspond to seeds which are
     identical in both files (with gene ids updated to match the ids in the
     new seed file.
 
     Args:
-        geneSeeds (filepath): Path to current gene seeds
-        prevGeneSeeds (filepath): Path to previous genes seeds
-        prevSpalnGff (filepath): Path to previous scored hints
+        args.geneSeeds (filepath): Path to current gene seeds
+        args.prevGeneSeeds (filepath): Path to previous genes seeds
+        args.prevSpalnGff (filepath): Path to previous scored hints
     """
-    sys.stderr.write("[" + time.ctime() + "] Selecting a subset of data to run"
-                     " in the next iteration\n")
+    stderr_message("Selecting a subset of data to run in the next iteration")
 
-    os.chdir(workDir)
+    os.chdir(args.workdir)
 
-    callScript("print_longest_isoform.py", geneSeeds +
-               " > longest_seed_isoforms.gtf")
+    callScript('print_longest_isoform.py -i', f'''{args.geneSeeds}
+        -o longest_seed_isoforms.gtf''')
 
-    callScript("print_longest_isoform.py", prevGeneSeeds +
-               " > longest_prevSeed_isoforms.gtf")
+    callScript('print_longest_isoform.py -i', f'''{args.prevGeneSeeds}
+        -o longest_prevSeed_isoforms.gtf''')
 
-    callScript("select_for_next_iteration.py", "--geneSeeds " +
-               "longest_seed_isoforms.gtf --prevGeneSeeds " +
-               "longest_prevSeed_isoforms.gtf --prevSpalnGff " +
-               prevSpalnGff + " --uniqueNewSeedsOut uniqueSeeds.gtf " +
-               "--identicalSpalnGffOut prevHints.gff")
+    callScript("select_for_next_iteration.py",
+        ' '.join(["--geneSeeds ", "longest_seed_isoforms.gtf",
+            "--prevGeneSeeds", "longest_prevSeed_isoforms.gtf",
+            "--prevSpalnGff", args.prevSpalnGff,
+            "--uniqueNewSeedsOut", "uniqueSeeds.gtf"
+            "--identicalSpalnGffOut", "prevHints.gff"])
+        )
     os.remove("longest_prevSeed_isoforms.gtf")
     os.remove("longest_seed_isoforms.gtf")
 
 
-def runGeneMarkES(pbs, fungus):
+def runGeneMarkES(args):
     """Run GeneMark-ES
 
     Args:
         pbs (boolean): Whether to run on pbs
+        fungus (boolean): Whether to run in fungus mode
 
     Returns:
         string: Path to genemark gff output
     """
-    sys.stderr.write("[" + time.ctime() + "] Running GeneMark-ES.\n")
-    ESDir = workDir + "/GeneMark_ES"
+    stderr_message("Running GeneMark-ES.")
+    ESDir = args.workdir + "/GeneMark_ES"
     if not os.path.isdir(ESDir):
         os.mkdir(ESDir)
     os.chdir(ESDir)
 
-    pbsFlag = ""
-    if pbs:
-        pbsFlag = " --pbs"
+    cmd = ["gmes_petap.pl", "--verbose", "--cores", args.threads,
+        "--ES", "--seq", args.genome, "--soft", "auto"]
 
-    fungusFlag = ""
-    if fungus:
-        fungusFlag = " --fungus"
+    if args.pbs:
+        cmd.append('--pbs')
+    if args.fungus:
+        cmd.append('--fungus')
 
-    callDependency("gmes_petap.pl", "--verbose --cores " + threads + pbsFlag +
+    runSubprocess(cmd)  # gmes_petap.pl should be in your PATH.
+    '''callDependency("gmes_petap.pl", "--verbose --cores " + threads + pbsFlag +
                    " --ES --seq " + genome + " --soft auto" + fungusFlag,
-                   "GeneMarkES")
+                   "GeneMarkES")'''
 
-    sys.stderr.write("[" + time.ctime() + "] GeneMark-ES finished.\n")
+    stderr_message("GeneMark-ES finished.")
+
+    dir_list = ['data', 'info', 'run', 'output']
+    for folder in dir_list:
+        if os.path.isdir(folder):
+            shutil.rmtree(folder)
+
     return os.path.abspath("genemark.gtf")
 
 
-def translateSeeds(seedGenes):
+def translateSeeds(args, seedGenes):
     """Translate GeneMark-ES seeds to proteins
 
     Args:
         seedGenes (filepath): Path to file with seed genes
     """
-    sys.stderr.write("[" + time.ctime() + "] Translating gene seeds to " +
-                     "proteins\n")
-    os.chdir(workDir)
+    stderr_message("Translating gene seeds to proteins")
+    os.chdir(args.workdir)
 
-    callScript("print_longest_isoform.py", seedGenes +
-               " > longest_seed_isoforms.gtf")
+    callScript('print_longest_isoform.py', f'-i {seedGenes}')
 
     systemCall("grep \tCDS\t longest_seed_isoforms.gtf > " +
                "longest_seed_isoforms_cds.gtf")
     os.remove("longest_seed_isoforms.gtf")
 
     callScript("proteins_from_gtf.pl", "--stat gene_stat.yaml --seq " +
-               genome + " --annot longest_seed_isoforms_cds.gtf --out " +
+               args.genome + " --annot longest_seed_isoforms_cds.gtf --out " +
                "seed_proteins.faa --format GTF")
     os.remove("longest_seed_isoforms_cds.gtf")
 
-    sys.stderr.write("[" + time.ctime() + "] Translation of seeds finished\n")
+    stderr_message("Translation of seeds finished")
 
 
-def runDiamond(maxProteins, evalue):
+def runDiamond(args):
     """Run DIAMOND protein search
 
     Args:
@@ -219,43 +219,45 @@ def runDiamond(maxProteins, evalue):
     Returns:
         string: Path to DIAMOND output
     """
-    sys.stderr.write("[" + time.ctime() + "] Running DIAMOND\n")
+    stderr_message("Running DIAMOND")
 
-    diamondDir = workDir + "/diamond"
+    diamondDir = args.workdir + "/diamond"
     if not os.path.isdir(diamondDir):
         os.mkdir(diamondDir)
     os.chdir(diamondDir)
 
-    # Make DIAMOND db
-    callDependency("diamond", "makedb --in " + proteins + " -d diamond_db " +
-                   "--threads " + threads)
+    if not args.diamond_db:
+        # Make DIAMOND db
+        callDependency("diamond", "makedb --in " + args.proteins + " -d diamond_db " +
+                       "--threads " + args.threads)
+        args.diamond_db = 'diamond_db'
 
     # Actual DIAMOND run
     callDependency("diamond", "blastp --query ../seed_proteins.faa --db " +
-                   "diamond_db --outfmt 6 qseqid sseqid --out diamond.out " +
-                   "--max-target-seqs " + str(maxProteins) + " --max-hsps 1 " +
-                   "--threads " + threads + " --evalue " + str(evalue))
+                   f"{args.diamond_db} --outfmt 6 qseqid sseqid --out diamond.out " +
+                   "--max-target-seqs " + str(args.maxProteinsPerSeed) + " --max-hsps 1 " +
+                   "--threads " + args.threads + " --evalue " + str(args.evalue))
 
-    sys.stderr.write("[" + time.ctime() + "] DIAMOND finished\n")
+    stderr_message('DIAMOND finished')
     return os.path.abspath("diamond.out")
 
 
-def prepareSeedSequences(diamondPairs):
+def prepareSeedSequences(args):
     """Prepare nucleotide sequences for seed genes
 
     Args:
         diamondPairs (filepath): Path to file with seed gene-protein pairs
     """
     sys.stderr.write("[" + time.ctime() + "] Preparing pairs for alignments\n")
-    os.chdir(workDir)
+    os.chdir(args.workdir)
 
-    callScript("nucseq_for_selected_genes.pl", "--seq " + genome + " --out " +
-               "nuc.fasta --gene gene_stat.yaml --list " + diamondPairs)
+    callScript("nucseq_for_selected_genes.pl", "--seq " + args.genome + " --out " +
+               "nuc.fasta --gene gene_stat.yaml --list " + args.diamondPairs)
 
-    sys.stderr.write("[" + time.ctime() + "] Preparation of pairs finished\n")
+    stderr_message('Preparation of pairs finished')
 
 
-def runSpaln(diamondPairs, pbs, minExonScore, nonCanonical,
+def runSpaln(args, diamondPairs, pbs, minExonScore, nonCanonical,
              longGene, longProtein):
     """Run Spaln spliced alignment and score the outputs with spaln-boundary-scorer
 
@@ -271,7 +273,7 @@ def runSpaln(diamondPairs, pbs, minExonScore, nonCanonical,
         longProtein (int): Threshold for what is considered a long protein in
                            Spaln alignment
     """
-    spalnDir = workDir + "/Spaln"
+    spalnDir = os.path.join(args.workdir, "Spaln")
     if not os.path.isdir(spalnDir):
         os.mkdir(spalnDir)
     os.chdir(spalnDir)
@@ -281,28 +283,28 @@ def runSpaln(diamondPairs, pbs, minExonScore, nonCanonical,
         nonCanonicalFlag = " --nonCanonical "
 
     if not pbs:
-        callScript("run_spliced_alignment.pl", "--cores " + threads +
-                   " --nuc ../nuc.fasta --list " + diamondPairs + " --prot " +
-                   proteins + " --v --aligner spaln --min_exon_score " +
+        callScript("run_spliced_alignment.pl", "--cores " + args.threads +
+                   " --nuc ../nuc.fasta --list " + args.diamondPairs + " --prot " +
+                   args.proteins + " --v --aligner spaln --min_exon_score " +
                    str(minExonScore) + nonCanonicalFlag +
                    " --longGene " + str(longGene) +
                    " --longProtein " + str(longProtein))
     else:
-        callScript("run_spliced_alignment_pbs.pl", "--N 120 --K " + threads +
-                   " --seq ../nuc.fasta --list " + diamondPairs + " --db " +
-                   proteins + " --v --aligner spaln --min_exon_score " +
+        callScript("run_spliced_alignment_pbs.pl", "--N 120 --K " + args.threads +
+                   " --seq ../nuc.fasta --list " + args.diamondPairs + " --db " +
+                   args.proteins + " --v --aligner spaln --min_exon_score " +
                    str(minExonScore) + nonCanonicalFlag +
                    " --longGene " + str(longGene) +
                    " --longProtein " + str(longProtein))
 
 
-def checkOutputs(diamondPairs, seedGenes):
+def checkOutputs(args):
     """Check whether all intermediate outputs were correctly created
 
     Args:
-        diamondPairs (filepath): Path to file with seed gene-protein pairs
+        args.diamondPairs (filepath): Path to file with seed gene-protein pairs
     """
-    os.chdir(workDir)
+    os.chdir(args.workdir)
 
     msg = 'This error can be caused by:\n' \
           '    a) The set of input proteins is too small and/or the ' \
@@ -313,30 +315,30 @@ def checkOutputs(diamondPairs, seedGenes):
           'separately to identify errors related to gene seeds (' \
           'https://github.com/gatech-genemark/ProtHint#genemark-es).'
 
-    if os.stat(diamondPairs).st_size == 0:
+    if os.stat(args.diamondPairs).st_size == 0:
         sys.exit('error: No homologous proteins were found by DIAMOND (' +
-                 diamondPairs + ' is empty).\nThis error can be caused' + msg)
+                 args.diamondPairs + ' is empty).\nThis error can be caused' + msg)
 
     if os.stat("Spaln/spaln.gff").st_size == 0:
         sys.exit('error: No spliced alignments were created by Spaln (' +
-                 workDir + '/Spaln/spaln.gff is empty).\n' + msg)
+                 args.workdir + '/Spaln/spaln.gff is empty).\n' + msg)
 
 
-def flagTopProteins(diamondPairs):
+def flagTopProteins(args):
     """Label hints which were mapped from the best DIAMOND target
 
     Args:
         diamondPairs (filepath): Path to file with seed gene-protein pairs
     """
-    sys.stderr.write("[" + time.ctime() + "] Flagging top chains\n")
-    os.chdir(workDir)
+    stderr_message('Flagging top chains')
+    os.chdir(args.workdir)
 
-    callScript("flag_top_proteins.py", "Spaln/spaln.gff " + diamondPairs +
+    callScript("flag_top_proteins.py", "Spaln/spaln.gff " + args.diamondPairs +
                " > tmp")
     shutil.move("tmp", "Spaln/spaln.gff")
 
 
-def processSpalnOutput(nonCanonical):
+def processSpalnOutput(args):
     """Prepare the final output from Spaln result scored by spaln-boundary-scorer
        Convert the output to GeneMark and Augustus compatible formats
 
@@ -344,8 +346,8 @@ def processSpalnOutput(nonCanonical):
         nonCanonical (bool): Whether to add non-canonical introns to the
                              high-confidence set
     """
-    sys.stderr.write("[" + time.ctime() + "] Processing the output\n")
-    os.chdir(workDir)
+    stderr_message('Processing the output')
+    os.chdir(args.workdir)
 
     processSpalnIntrons()
     processSpalnStops()
@@ -356,7 +358,7 @@ def processSpalnOutput(nonCanonical):
 
     # High confidence
     nonCanonicalFlag = ""
-    if nonCanonical:
+    if args.nonCanonicalSpliceSites:
         nonCanonicalFlag = " --addAllSpliceSites "
 
     callScript("print_high_confidence.py", "prothint.gff " + nonCanonicalFlag +
@@ -365,7 +367,7 @@ def processSpalnOutput(nonCanonical):
     # Augustus compatible format
     callScript("prothint2augustus.py", "prothint.gff evidence.gff "
                "top_chains.gff prothint_augustus.gff")
-    sys.stderr.write("[" + time.ctime() + "] Output processed\n")
+    stderr_message('Output processed')
 
 
 def processSpalnIntrons():
@@ -459,15 +461,15 @@ def printTopChains():
     os.remove("topProteinsFiltered.gff")
 
 
-def cleanup():
+def cleanup(args):
     """Delete temporary files and intermediate results
     """
     sys.stderr.write("[" + time.ctime() + "] Cleaning up\n")
-    os.chdir(workDir)
+    os.chdir(args.workdir)
 
     try:
         os.remove("gene_stat.yaml")
-        os.remove("seed_proteins.faa")
+        # os.remove("seed_proteins.faa")
         os.remove("nuc.fasta")
     except OSError:
         pass
@@ -482,13 +484,6 @@ def cleanup():
     except OSError:
         pass
 
-    if os.path.exists("GeneMark_ES"):
-        shutil.rmtree("GeneMark_ES/data", ignore_errors=True)
-        shutil.rmtree("GeneMark_ES/info", ignore_errors=True)
-        shutil.rmtree("GeneMark_ES/run", ignore_errors=True)
-        shutil.rmtree("GeneMark_ES/output/data", ignore_errors=True)
-        shutil.rmtree("GeneMark_ES/output/gmhmm", ignore_errors=True)
-
 
 def processInputProteins(args):
     """Remove dots from the input file with proteins.
@@ -496,13 +491,15 @@ def processInputProteins(args):
        compatible with DIAMOND.
        Clean fasta headers by removing pipe ("|") characters.
     """
-    global proteins
-    sys.stderr.write("[" + time.ctime() + "] Pre-processing protein input\n")
-    os.chdir(workDir)
+    stderr_message('Pre-processing protein input.')
+    os.chdir(args.workdir)
     protFile = tempfile.NamedTemporaryFile(delete=False, dir='.', prefix="prot")
     systemCall('sed \"s/\.//\" ' + args.proteins + ' | sed \"s/|/_/g\" > ' +
                protFile.name)
-    proteins = checkFileAndMakeAbsolute(protFile.name)
+
+    args.proteins = checkFileAndMakeAbsolute(protFile.name)
+
+    return args
 
 
 def setEnvironment(args):
@@ -512,17 +509,21 @@ def setEnvironment(args):
         args (dictionary): Command line arguments
 
     """
+    ProtHintRef = 'https://doi.org/10.1093/nargab/lqaa026'
+    DIAMONDRef = 'https://doi.org/10.1038/nmeth.3176'
+    SpalnRef = 'https://doi.org/10.1093/bioinformatics/btn460'
+
     sys.stderr.write("ProtHint Version " + VERSION + "\n")
     sys.stderr.write("Copyright 2019, Georgia Institute of Technology, USA\n\n")
     sys.stderr.write("Please cite\n")
     sys.stderr.write("  - ProtHint: " + ProtHintRef + "\n")
     sys.stderr.write("  - DIAMOND:  " + DIAMONDRef + "\n")
     sys.stderr.write("  - Spaln:    " + SpalnRef + "\n\n")
-    global workDir, binDir, genome, threads
-    workDir = os.path.abspath(args.workdir)
+    global binDir
+    args.workdir = os.path.abspath(args.workdir)
     binDir = os.path.abspath(os.path.dirname(__file__))
 
-    genome = checkFileAndMakeAbsolute(args.genome)
+    args.genome = checkFileAndMakeAbsolute(args.genome)
     args.proteins = checkFileAndMakeAbsolute(args.proteins)
 
     if args.ProSplign:
@@ -560,25 +561,27 @@ def setEnvironment(args):
                      "to seed genes in the DIAMOND pairs file must be specified.")
         args.diamondPairs = checkFileAndMakeAbsolute(args.diamondPairs)
 
-    if not os.path.isdir(workDir):
-        os.mkdir(workDir)
+    if not os.path.isdir(args.workdir):
+        os.mkdir(args.workdir)
 
     # Log info about cmd
     callDir = "Called from: " + os.path.abspath(".") + "\n"
     cmd = "Cmd: " + " ".join(sys.argv) + "\n\n"
     sys.stderr.write(callDir)
     sys.stderr.write(cmd)
-    with open(workDir + "/cmd.log", "w") as file:
+    with open(os.path.join(args.workdir, "cmd.log"), "w") as file:
         file.write(callDir)
         file.write(cmd)
 
-    if args.threads > 0:
-        threads = str(args.threads)
-    else:
+    if args.threads < 1:
         if hasattr(os, "sched_getaffinity"):
-             threads = str(len(os.sched_getaffinity(0)))
+            args.threads = len(os.sched_getaffinity(0))
         else:
-             threads = str(os.cpu_count() or 1)
+            args.threads = os.cpu_count() or 1
+    args.threads = str(args.threads)
+
+    return args
+
 
 def checkFileAndMakeAbsolute(file):
     """Check if a file with given name exists and make the path to it absolute
@@ -587,9 +590,23 @@ def checkFileAndMakeAbsolute(file):
         file (filepath): Path to the file
     """
     if not os.path.isfile(file):
-        sys.stderr.write("error: File \"" + file + "\" was not found.\n")
-        sys.exit()
+        sys.exit(f'error: File "{file}" was not found.\n')
     return os.path.abspath(file)
+
+
+def runSubprocess(cmd):
+    """Run a subprocess
+
+    Args:
+        cmd (list): Command and args to run
+    """
+    sys.stderr.flush()
+    cmd = list(map(str, cmd))
+    print(f"Running {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
+    """if comp_proc.returncode != 0:
+        sys.exit(f'''[{time.ctime()}] error: ProtHint exited due to an
+                error in command: {" ".join(cmd)}''')"""
 
 
 def systemCall(cmd):
@@ -600,8 +617,8 @@ def systemCall(cmd):
     """
     sys.stderr.flush()
     if subprocess.call(["bash", "-c", cmd]) != 0:
-        sys.exit('[' + time.ctime() + '] error: ProtHint exited due to an ' +
-                 'error in command: ' + cmd)
+        sys.exit(f'''[{time.ctime()}] error: ProtHint exited due to an
+                error in command: {cmd}''')
 
 
 def callScript(name, args):
@@ -633,11 +650,10 @@ def callDependency(name, args, location=''):
         sys.stderr.write('[' + time.ctime() + '] warning: Could not find ' +
                          name + ' in dependencies/' + location + ' folder.' +
                          ' Attempting to use ' + name + ' in the PATH.\n')
-        if shutil.which(name) is not None:
-            systemCall(name + ' ' + args)
+        if shutil.which(name):
+            systemCall(f'{name} {args}')
         else:
-            sys.exit('[' + time.ctime() + '] error: Could not find ' + name +
-                     ' in the PATH')
+            sys.exit(f'[{time.ctime()}] error: Could not find {name} in the PATH')
 
 
 def parseCmd():
@@ -646,11 +662,12 @@ def parseCmd():
     Returns:
         dictionary: Dictionary with arguments
     """
-    parser = argparse.ArgumentParser(description='ProtHint ' + VERSION + ': Pipeline for generating genome wide \
-                                     footprints of homologous proteins. The set of high confidence hints \
-                                     is generated using default thresholds in print_high_confidence.py \
-                                     script. If you wish to use different filtering criteria, re-run\
-                                     print_high_confidence.py script with custom thresholds.')
+    parser = argparse.ArgumentParser(
+        description=f'''ProtHint {VERSION}: Pipeline for generating genome wide
+         footprints of homologous proteins. The set of high confidence hints
+         is generated using default thresholds in print_high_confidence.py
+         script. If you wish to use different filtering criteria, re-run
+         print_high_confidence.py script with custom thresholds.''')
 
     parser.add_argument('genome', metavar='genome.fasta', type=str,
                         help='Input genomic sequence in FASTA format.')
@@ -693,14 +710,22 @@ def parseCmd():
     parser.add_argument('--version', action='version', version='%(prog)s ' + VERSION)
 
     parser.add_argument('--prevGeneSeeds', type=str, default='',
-                        help='File with gene seeds which were used in the previous iteration. Next iteration of ProtHint is only executed for --geneSeeds which \
-                        differ from --prevGeneSeeds. --prevSpalnGff is required when this option is used since results from the previous iteration are reused \
-                        for seeds which do not differ (Gene ids of such hints are updated to match the new seed genes).')
+                        help='''File with gene seeds which were used in the
+                        previous iteration. Next iteration of ProtHint is only
+                        executed for --geneSeeds which differ from
+                        --prevGeneSeeds. --prevSpalnGff is required when this
+                        option is used since results from the previous
+                        iteration are reused for seeds which do not differ
+                        (Gene ids of such hints are updated to match the new
+                         seed genes).''')
     parser.add_argument('--prevSpalnGff', type=str, default='',
                         help='Scored hints from previous iteration.')
 
-    parser.add_argument('--ProSplign',  default=False, action='store_true',
+    parser.add_argument('--ProSplign', default=False, action='store_true',
                         help=argparse.SUPPRESS)
+
+    parser.add_argument('--diamond-db', default=False, type=str,
+                        help='Prepared Diamond protein database.')
 
     return parser.parse_args()
 
